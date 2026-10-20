@@ -1,0 +1,69 @@
+rules:
+  - id: mass-assignment-privileged-field
+    languages: [python]
+    severity: WARNING
+    mode: taint
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      owasp: "API3:2023 Broken Object Property Level Authorization"
+      confidence: MEDIUM
+      # Gate policy: Logs only. No benchmark target exercises this rule: VAmPI's instance is the
+      # documented control-flow miss and DVNA has none. An unmeasured rule does
+      # not get to block a release, however good its fixtures look.
+      security-severity: "6.5"
+      impact: HIGH
+      likelihood: HIGH
+      technology: [flask, django, sqlalchemy]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+        - https://cwe.mitre.org/data/definitions/915.html
+    message: |
+      A value from the request body reaches a privilege-bearing model field.
+      A caller can set this field by adding it to the JSON they send, which is
+      mass assignment: the endpoint's contract says "register a user", the
+      implementation says "set any column you can name".
+
+      Taint mode is used deliberately. The dangerous version of this bug almost
+      never looks like `User(admin=request.json["admin"])`. It looks like three
+      innocuous lines that launder the value through a local first, which is
+      exactly what the flagged code does.
+
+      Fix: bind an explicit allowlist of client-settable fields. Never pass the
+      parsed body into a model constructor or `setattr` loop, and never trust a
+      serialiser's default of "every field is writable".
+    pattern-sources:
+      - pattern: flask.request.get_json(...)
+      - pattern: request.get_json(...)
+      - pattern: request.json
+      - pattern: request.form
+      - pattern: request.data
+      - pattern: request.args
+      - pattern: self.request.data
+    pattern-sinks:
+      # A privilege-bearing keyword argument to any constructor or call.
+      - patterns:
+          - pattern: $M(..., $FIELD=$SINK, ...)
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: (?i)^(admin|is_admin|isadmin|is_staff|is_superuser|superuser|role|roles|permission|permissions|scope|scopes|is_active|active|verified|is_verified|email_verified|balance|credit|credits|amount|price|discount|owner|owner_id|user_id|account_id|tenant_id|org_id|group|groups)$
+          - focus-metavariable: $SINK
+      # Assignment to a privilege-bearing attribute.
+      - patterns:
+          - pattern: $OBJ.$FIELD = $SINK
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: (?i)^(admin|is_admin|isadmin|is_staff|is_superuser|superuser|role|roles|permission|permissions|scope|scopes|is_active|verified|is_verified|balance|credit|credits|price|discount|owner|owner_id|user_id|account_id|tenant_id|org_id)$
+          - focus-metavariable: $SINK
+      # Blind splat of the parsed body into a model. Always wrong, no field
+      # name needed: whatever columns exist become client-writable.
+      - pattern: $MODEL(**$SINK)
+      # setattr loop, the hand-rolled splat. The sink is the ATTRIBUTE NAME,
+      # not the value: `for k in body: setattr(u, k, body[k])` lets the caller
+      # choose which column to write, while
+      # `for k in ("bio","email"): setattr(u, k, body[k])` does not. Focusing
+      # on $K is what separates the two, since only the first taints the name.
+      - patterns:
+          - pattern: setattr($OBJ, $K, $V)
+          - focus-metavariable: $K

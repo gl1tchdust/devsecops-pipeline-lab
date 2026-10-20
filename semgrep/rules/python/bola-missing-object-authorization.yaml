@@ -1,0 +1,68 @@
+rules:
+  - id: missing-object-authorization
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp: "API1:2023 Broken Object Level Authorization"
+      confidence: MEDIUM
+      # Gate policy: Blocks. Measured precision 1.000 on VAmPI (2 TP, 0 FP). Highest-confidence
+      # rule in the set and the impact is account takeover.
+      security-severity: "8.0"
+      impact: HIGH
+      likelihood: MEDIUM
+      technology: [flask, sqlalchemy]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+        - https://cwe.mitre.org/data/definitions/639.html
+    message: |
+      This route handler loads a record using an identifier that came from the
+      request (the handler parameter `$ID`), but the query is not constrained to
+      the authenticated principal. Any caller holding a valid token can read or
+      modify another user's object by changing the identifier.
+
+      Authentication is not authorization. A token check earlier in the handler
+      proves *who* is calling, not *what* they may touch.
+
+      Fix: bind the query to the identity carried by the credential, e.g.
+        owner = User.query.filter_by(username=claims["sub"]).first()
+        obj   = Model.query.filter_by(user=owner, id=$ID).first()
+      or apply a role check before the load if the route is intentionally
+      administrative.
+    patterns:
+      # The identifier is a parameter of the enclosing handler. Flask/connexion
+      # pass path parameters to handlers as named arguments, so a bare parameter
+      # is request-controlled by definition.
+      - pattern-inside: |
+          def $HANDLER(..., $ID, ...):
+              ...
+      # An ORM load keyed on that identifier. $CAST covers the common
+      # str()/int()/uuid.UUID() coercion wrappers.
+      - pattern-either:
+          - pattern: $MODEL.query.filter_by(..., $COL=$ID, ...)
+          - pattern: $MODEL.query.filter_by(..., $COL=$CAST($ID), ...)
+          - pattern: $MODEL.query.get($ID)
+          - pattern: $MODEL.query.get($CAST($ID))
+          - pattern: $SESSION.query($MODEL).filter_by(..., $COL=$ID, ...)
+          - pattern: $SESSION.query($MODEL).filter_by(..., $COL=$CAST($ID), ...)
+      # ...and the same call does not narrow by an ownership column. These names
+      # are the tenancy conventions this codebase uses; extend per project.
+      - pattern-not: $Q.filter_by(..., user=..., ...)
+      - pattern-not: $Q.filter_by(..., user_id=..., ...)
+      - pattern-not: $Q.filter_by(..., owner=..., ...)
+      - pattern-not: $Q.filter_by(..., owner_id=..., ...)
+      - pattern-not: $Q.filter_by(..., account_id=..., ...)
+      - pattern-not: $Q.filter_by(..., tenant_id=..., ...)
+      # A static or class method is data-layer plumbing, not a route handler.
+      # Authorization belongs to the caller, so flagging the model is noise.
+      # This is what kept the rules off VAmPI's models/user_model.py.
+      - pattern-not-inside: |
+          @staticmethod
+          def $F(...):
+              ...
+      - pattern-not-inside: |
+          @classmethod
+          def $F(...):
+              ...

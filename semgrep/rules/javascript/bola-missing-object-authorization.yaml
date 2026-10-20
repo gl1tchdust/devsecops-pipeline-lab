@@ -1,0 +1,75 @@
+rules:
+  - id: js-bola-missing-object-authorization
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp: "API1:2023 Broken Object Level Authorization"
+      confidence: MEDIUM
+      # Gate policy: Logs only. Measured precision 0.333 on DVNA (2 TP, 4 FP). DVNA's Product
+      # model has no owner column, so the rule cannot win there. Blocking on a
+      # rule that is wrong two times in three is how gates get routed around.
+      security-severity: "5.0"
+      impact: HIGH
+      likelihood: HIGH
+      technology: [express, sequelize, mongoose]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+        - https://cwe.mitre.org/data/definitions/639.html
+    message: |
+      This ORM load is keyed on a value from `req.body`, `req.query` or
+      `req.params`, and the call makes no reference to the authenticated
+      principal. Any logged-in caller can address another user's row by
+      changing the identifier they send.
+
+      In Express this bug has a very specific tell: the handler reads
+      `req.body.id` where it should read `req.user.id`. Both are one token
+      long, both work in testing, and only one of them is safe.
+
+      Fix: key the query on the session identity, or add an ownership column
+      to the same `where` clause:
+        where: { id: req.params.id, userId: req.user.id }
+    patterns:
+      - pattern-either:
+          # Sequelize
+          # findAll is deliberately absent. BOLA is about addressing one
+          # object; a list or search returning many rows is a filtering
+          # concern and belongs to the BFLA rule. Including it here cost
+          # precision on DVNA's product search for nothing.
+          - pattern: $DB.$MODEL.find($OPTS)
+          - pattern: $DB.$MODEL.findOne($OPTS)
+          - pattern: $DB.$MODEL.findByPk($OPTS)
+          - pattern: $DB.$MODEL.destroy($OPTS)
+          - pattern: $MODEL.find($OPTS)
+          - pattern: $MODEL.findOne($OPTS)
+          - pattern: $MODEL.findByPk($OPTS)
+          # Mongoose
+          - pattern: $MODEL.findById($OPTS)
+          - pattern: $MODEL.findByIdAndUpdate($OPTS, ...)
+          - pattern: $MODEL.findByIdAndDelete($OPTS)
+          - pattern: $MODEL.findOneAndUpdate($OPTS, ...)
+          - pattern: $MODEL.deleteOne($OPTS)
+      # The identifier comes from the request. Unlike Python, Express makes the
+      # source syntactically explicit, so no taint analysis is needed here.
+      - metavariable-pattern:
+          metavariable: $OPTS
+          pattern-either:
+            - pattern: req.body.$F
+            - pattern: req.query.$F
+            - pattern: req.params.$F
+            - pattern: req.body[$K]
+            - pattern: req.query[$K]
+            - pattern: req.params[$K]
+      # ...and the call says nothing about who is asking.
+      #
+      # This exclusion is textual, scoped to the matched call. A structural
+      # `pattern-not` on the where-clause shape was tried first and silently
+      # suppressed every match, so this is the honest version.
+      #
+      # Its cost is recall, not precision: because the rule needs the request
+      # reference inside the call it matches, a `where` clause assembled in an
+      # intermediate variable is skipped whether or not it is safely scoped.
+      # Fixture `whereClauseInVariable` records that miss. See the README.
+      - pattern-not-regex: 'req\.(user|session)'

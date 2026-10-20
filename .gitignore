@@ -1,0 +1,33 @@
+# Scan output
+reports/
+*.sarif
+gate-output.txt
+
+# Scan targets are fetched, never vendored
+target/*/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets - never commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.*
+credentials.*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+.hypothesis/
+benchmark-results/

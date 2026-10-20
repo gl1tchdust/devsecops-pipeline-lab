@@ -1,0 +1,105 @@
+rules:
+  - id: bfla-missing-function-authorization
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-862: Missing Authorization"
+      owasp: "API5:2023 Broken Function Level Authorization"
+      confidence: LOW
+      # Gate policy: Blocks, just. Measured precision 0.750 on VAmPI (3 TP, 1 FP), exactly at the
+      # 0.75 floor. Drop below it and this becomes a WARNING.
+      security-severity: "7.0"
+      impact: HIGH
+      likelihood: MEDIUM
+      technology: [flask, django, sqlalchemy]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
+        - https://cwe.mitre.org/data/definitions/862.html
+    message: |
+      This handler reaches a privileged operation (a bulk read, a delete, or a
+      role change) with no authorization check anywhere in the function body
+      and no auth decorator. Whoever can reach the route can run the operation.
+
+      BOLA asks "may you touch *this* object". BFLA asks "may you call this
+      operation at all". The second is the one that gets shipped by accident,
+      because an admin-only endpoint usually works correctly when an admin
+      tests it.
+
+      Confidence is deliberately LOW. The list of names that count as an
+      authorization check is project configuration, not a universal constant:
+      see the `pattern-not-inside` block and the README before trusting a
+      finding or a clean result.
+
+      Fix: resolve the caller's identity and assert a role or permission before
+      the operation, or move the route behind an auth decorator.
+    patterns:
+      - pattern-inside: |
+          def $HANDLER(...):
+              ...
+      # A privileged operation: bulk reads, destructive writes, role changes.
+      - pattern: $OBJ.$OP(...)
+      - metavariable-regex:
+          metavariable: $OP
+          regex: (?i)^(get_all[_a-z]*|all_[a-z]+|list_all[_a-z]*|delete_[a-z_]+|drop_[a-z_]+|purge[_a-z]*|promote[_a-z]*|grant[_a-z]*|revoke[_a-z]*|set_role|make_admin|impersonate[_a-z]*)$
+      # ...with no in-body authorization check. These names are this project's
+      # conventions. Extend the list per codebase; a rule that does not know
+      # your auth helper's name will report every handler.
+      - pattern-not-inside: |
+          def $HANDLER(...):
+              ...
+              token_validator(...)
+              ...
+      - pattern-not-inside: |
+          def $HANDLER(...):
+              ...
+              $X.current_user
+              ...
+      - pattern-not-inside: |
+          def $HANDLER(...):
+              ...
+              require_role(...)
+              ...
+      - pattern-not-inside: |
+          def $HANDLER(...):
+              ...
+              check_permission(...)
+              ...
+      - pattern-not-inside: |
+          def $HANDLER(...):
+              ...
+              authorize(...)
+              ...
+      # ...and not behind an auth decorator.
+      - pattern-not-inside: |
+          @login_required
+          def $HANDLER(...):
+              ...
+      - pattern-not-inside: |
+          @jwt_required(...)
+          def $HANDLER(...):
+              ...
+      - pattern-not-inside: |
+          @requires_auth(...)
+          def $HANDLER(...):
+              ...
+      - pattern-not-inside: |
+          @admin_required
+          def $HANDLER(...):
+              ...
+      - pattern-not-inside: |
+          @permission_required(...)
+          def $HANDLER(...):
+              ...
+      # A static or class method is data-layer plumbing, not a route handler.
+      # Authorization belongs to the caller, so flagging the model is noise.
+      # This is what kept the rules off VAmPI's models/user_model.py.
+      - pattern-not-inside: |
+          @staticmethod
+          def $F(...):
+              ...
+      - pattern-not-inside: |
+          @classmethod
+          def $F(...):
+              ...

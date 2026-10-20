@@ -1,0 +1,388 @@
+name: security-pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so new CVEs against the pinned targets surface without a push.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: vampi-lab:ci
+  TARGET_URL: http://127.0.0.1:5000
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 0a. The lab's own code. If a rule or the gate is broken, nothing
+  # downstream is trustworthy, so this blocks everything else.
+  # ---------------------------------------------------------------------------
+  self-test:
+    name: self-test (rules + gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements-dev.txt
+
+      - name: Semgrep rule unit tests, python
+        run: semgrep test semgrep/rules/python
+
+      - name: Semgrep rule unit tests, javascript
+        run: semgrep test semgrep/rules/javascript
+
+      - name: Gate and benchmark unit tests
+        run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Stage 0b. Accuracy, measured against hand-labelled ground truth.
+  #
+  # The floors are the numbers published in the README. A rule edit that loses
+  # accuracy fails here rather than shipping quietly. Raise a floor only
+  # alongside the measurement that justifies it.
+  # ---------------------------------------------------------------------------
+  benchmark:
+    name: benchmark (precision + recall)
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet -r requirements-dev.txt
+      - name: Fetch targets
+        run: bash target/fetch.sh
+
+      - name: VAmPI, python rules
+        run: |
+          python benchmark/benchmark.py \
+            --target target/vampi --labels benchmark/labels/vampi.yml \
+            --rules semgrep/rules/python \
+            --min-precision 0.83 --min-recall 0.71 \
+            --json-out benchmark-results/vampi.json
+
+      - name: DVNA, javascript rules
+        run: |
+          python benchmark/benchmark.py \
+            --target target/dvna --labels benchmark/labels/dvna.yml \
+            --rules semgrep/rules/javascript \
+            --min-precision 0.375 --min-recall 1.0 \
+            --json-out benchmark-results/dvna.json
+
+      - name: Publish to job summary
+        if: always()
+        run: python benchmark/summarise.py benchmark-results >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: benchmark-results/
+
+  # ---------------------------------------------------------------------------
+  # Stage 1. SAST. Custom rules plus the registry baseline, both targets.
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: semgrep (SAST)
+    needs: self-test
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet semgrep
+      - name: Fetch targets
+        run: bash target/fetch.sh
+
+      - name: Scan targets
+        run: |
+          mkdir -p reports
+          semgrep \
+            --config semgrep/rules \
+            --config p/security-audit \
+            --metrics off \
+            --sarif -o reports/semgrep.sarif \
+            target/vampi/api_views target/vampi/models \
+            target/vampi/app.py target/vampi/config.py \
+            target/dvna/core target/dvna/routes target/dvna/models
+
+      - name: Upload to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report-semgrep
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 2. Trivy, three surfaces: dependencies, built image, IaC.
+  # ---------------------------------------------------------------------------
+  trivy:
+    name: trivy (deps + image + IaC)
+    needs: self-test
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch targets
+        run: bash target/fetch.sh vampi
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Build target image
+        run: docker build -q -t "$IMAGE" target/vampi
+
+      - name: Scan
+        run: |
+          mkdir -p reports
+          trivy fs     --scanners vuln --exit-code 0 --quiet \
+                       --format sarif -o reports/trivy-fs.sarif     target/vampi
+          trivy image  --scanners vuln --exit-code 0 --quiet \
+                       --format sarif -o reports/trivy-image.sarif  "$IMAGE"
+          trivy config --exit-code 0 --quiet \
+                       --format sarif -o reports/trivy-config.sarif target/vampi
+
+      - name: Upload dependency findings to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-fs.sarif
+          category: trivy-fs
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report-trivy
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 3. Snyk. Optional by design: a fork without the secret must still get
+  # a green, complete run rather than a confusing red one.
+  # ---------------------------------------------------------------------------
+  snyk:
+    name: snyk (optional)
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check for token
+        id: token
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "${SNYK_TOKEN}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Snyk skipped::SNYK_TOKEN is not configured. Add it in Settings > Secrets to enable this stage."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch target
+        if: steps.token.outputs.present == 'true'
+        run: bash target/fetch.sh vampi
+
+      - name: Scan
+        if: steps.token.outputs.present == 'true'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          mkdir -p reports
+          npm install -g snyk
+          snyk test --file=target/vampi/requirements.txt --package-manager=pip \
+                    --sarif-file-output=reports/snyk.sarif || true
+
+      - name: Upload
+        if: steps.token.outputs.present == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-snyk
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 4. Secrets, across the whole history. A rotated key that is still
+  # reachable in an old commit is still a leak.
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: gitleaks (full history)
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan history
+        run: |
+          mkdir -p reports
+          gitleaks detect --redact --exit-code 0 \
+            --report-format sarif --report-path reports/gitleaks.sarif
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report-gitleaks
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 5. SBOM with Syft, matched against vulnerability data by Grype.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: syft + grype (SBOM)
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch target
+        run: bash target/fetch.sh vampi
+
+      - name: Install syft and grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM and match
+        run: |
+          mkdir -p reports
+          syft "dir:target/vampi" -o cyclonedx-json=reports/sbom.cdx.json -q
+          grype "sbom:reports/sbom.cdx.json" -o sarif > reports/grype.sarif
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report-sbom
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 6. DAST. The only stage that sees the app actually running.
+  # ---------------------------------------------------------------------------
+  zap:
+    name: zap (DAST baseline)
+    needs: self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch target
+        run: bash target/fetch.sh vampi
+
+      - name: Start target
+        run: |
+          docker build -q -t "$IMAGE" target/vampi
+          docker run -d --rm --name vampi -p 5000:5000 "$IMAGE"
+          for _ in $(seq 1 60); do
+            curl -sf "$TARGET_URL/" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sf "$TARGET_URL/createdb" >/dev/null 2>&1 || true
+          curl -sf "$TARGET_URL/" >/dev/null
+
+      - name: Baseline scan
+        run: |
+          mkdir -p reports
+          # The ZAP image runs as its own uid and writes into the mount.
+          chmod 777 reports
+          docker run --rm --network host \
+            -v "$PWD/reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$TARGET_URL" -J zap.json -I || true
+          test -f reports/zap.json
+
+      - name: Stop target
+        if: always()
+        run: docker rm -f vampi || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report-zap
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Stage 7. The gate.
+  #
+  # The targets are deliberately vulnerable, so the gate is EXPECTED to fail.
+  # This job asserts the inverse: a gate that goes green against VAmPI and
+  # DVNA is a broken gate, and that is what turns this build red.
+  # ---------------------------------------------------------------------------
+  gate:
+    name: gate (fail on High/Critical)
+    needs: [benchmark, semgrep, trivy, snyk, gitleaks, sbom, zap]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+
+      - name: Collect every report
+        uses: actions/download-artifact@v8
+        with:
+          pattern: report-*
+          merge-multiple: true
+          path: reports
+
+      - name: List what arrived
+        run: ls -la reports/
+
+      - name: Evaluate gate
+        run: |
+          set +e
+          python gate/gate.py --reports reports --suppressions gate/suppressions.yml \
+            | tee gate-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "gate exit code: $rc"
+
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::gate could not read its inputs"
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::The gate passed a deliberately vulnerable target. The gate is broken."
+            exit 1
+          fi
+          echo "::notice title=Gate working::Gate blocked the release as expected (exit $rc)."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Gate result"
+            echo
+            echo 'The scan targets are deliberately vulnerable. A blocked release is the'
+            echo 'correct outcome; this job is green because the gate did its job.'
+            echo
+            echo '```'
+            cat gate-output.txt 2>/dev/null || echo "(no gate output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gate-output
+          path: gate-output.txt

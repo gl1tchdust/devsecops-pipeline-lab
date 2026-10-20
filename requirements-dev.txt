@@ -1,0 +1,4 @@
+# Everything the lab's own code needs. The scanners install themselves in CI.
+pyyaml>=6.0
+pytest>=8.0
+semgrep>=1.100

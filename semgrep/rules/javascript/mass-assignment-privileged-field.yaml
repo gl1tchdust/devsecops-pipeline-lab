@@ -1,0 +1,87 @@
+rules:
+  - id: js-mass-assignment-privileged-field
+    languages: [javascript, typescript]
+    severity: WARNING
+    mode: taint
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      owasp: "API3:2023 Broken Object Property Level Authorization"
+      confidence: MEDIUM
+      # Gate policy: Logs only. Unmeasured: no benchmark target exercises it.
+      security-severity: "6.5"
+      impact: HIGH
+      likelihood: HIGH
+      technology: [express, sequelize, mongoose]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+        - https://cwe.mitre.org/data/definitions/915.html
+    message: |
+      The request body reaches a model write without an allowlist. Either the
+      whole body is handed to the ORM, or a privilege-bearing field is assigned
+      from it directly. A caller adds one key to their JSON and writes a column
+      the endpoint never meant to expose.
+
+      `Model.create(req.body)` is the shape everyone recognises. The one that
+      ships is `const body = req.body` on line 3 and `Model.create(body)` on
+      line 40, which is why this rule runs in taint mode rather than matching
+      the literal `req.body` at the call site.
+
+      Fix: pick the fields explicitly. In Sequelize, pass the `fields` option.
+      In Mongoose, do not trust the schema to be the allowlist, because a
+      schema lists the columns that exist, not the ones a client may set.
+    pattern-sources:
+      - pattern: req.body
+      - pattern: req.query
+      - pattern: req.params
+      - pattern: request.body
+      - pattern: ctx.request.body
+    pattern-sinks:
+      # The whole body handed to the ORM, no field selection.
+      #
+      # Every one of these excludes an object-literal argument. That exclusion
+      # is the difference between the bug and the fix: `create(body)` hands
+      # over whatever keys arrived, while
+      # `create({ name: req.body.name, email: req.body.email })` is the
+      # allowlist. Taint alone cannot tell them apart, because a literal built
+      # from tainted fields is itself tainted, so without this the rule flags
+      # the correct code too.
+      #
+      # Cost: `create({ ...req.body })` is an object literal and is therefore
+      # missed. Recorded in the fixtures. See the README.
+      - patterns:
+          - pattern: $MODEL.create($SINK)
+          - pattern-not: "$MODEL.create({...})"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: $DB.$MODEL.create($SINK)
+          - pattern-not: "$DB.$MODEL.create({...})"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: new $MODEL($SINK)
+          - pattern-not: "new $MODEL({...})"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: $MODEL.update($SINK, ...)
+          - pattern-not: "$MODEL.update({...}, ...)"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: $DB.$MODEL.update($SINK, ...)
+          - pattern-not: "$DB.$MODEL.update({...}, ...)"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: $MODEL.findByIdAndUpdate($ID, $SINK, ...)
+          - pattern-not: "$MODEL.findByIdAndUpdate($ID, {...}, ...)"
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern: Object.assign($TARGET, $SINK)
+          - pattern-not: "Object.assign($TARGET, {...})"
+          - focus-metavariable: $SINK
+      # A privilege-bearing property written from request data.
+      - patterns:
+          - pattern: $OBJ.$FIELD = $SINK
+          - metavariable-regex:
+              metavariable: $FIELD
+              regex: (?i)^(admin|isAdmin|is_admin|isStaff|isSuperuser|superuser|role|roles|permission|permissions|scope|scopes|isActive|active|verified|isVerified|emailVerified|balance|credit|credits|price|discount|owner|ownerId|owner_id|userId|user_id|accountId|tenantId|orgId)$
+          - focus-metavariable: $SINK

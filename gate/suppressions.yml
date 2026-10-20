@@ -1,0 +1,36 @@
+# Every suppression in this pipeline lives here. One file, so the exceptions
+# are reviewable in one diff instead of scattered across six tool configs.
+#
+# Rules enforced by gate/gate.py, not by convention:
+#   - `reason` is mandatory. No justification, no suppression.
+#   - `expires` is mandatory and is enforced. Past the date the gate fails on
+#     the suppression itself, so a stale exception breaks the build instead of
+#     quietly becoming permanent.
+#   - `tool` and `path` narrow the match. Without them a rule id is silenced
+#     everywhere, including in code where it is a genuine finding.
+#
+# Fields:
+#   id       rule id or CVE, exactly as the tool emits it   (required)
+#   reason   one line, why this is acceptable               (required)
+#   expires  ISO date, inclusive: valid on the day itself   (required)
+#   tool     substring match against the reporting tool     (optional)
+#   path     substring match against the finding location   (optional)
+
+suppressions:
+  - id: DS-0025
+    tool: trivy
+    path: Dockerfile
+    reason: >-
+      Build-layer size hygiene in the third-party target image, not a
+      vulnerability in anything this pipeline ships. Upstream Dockerfile, we do
+      not patch the target.
+    expires: 2026-12-06
+
+  - id: DS-0002
+    tool: trivy
+    path: Dockerfile
+    reason: >-
+      The target container runs as root by design and is never published or
+      deployed. It exists to be attacked inside CI. Revisit if this image is
+      ever pushed to a registry.
+    expires: 2026-12-06

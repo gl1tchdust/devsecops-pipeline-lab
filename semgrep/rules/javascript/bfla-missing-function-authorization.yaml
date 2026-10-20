@@ -1,0 +1,137 @@
+rules:
+  - id: js-bfla-missing-function-authorization
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      subcategory: [audit]
+      cwe: "CWE-862: Missing Authorization"
+      owasp: "API5:2023 Broken Function Level Authorization"
+      confidence: LOW
+      # Gate policy: Logs only. Measured precision 0.500 on DVNA (1 TP, 1 FP). Express keeps its
+      # authorization in route middleware this rule cannot see.
+      security-severity: "6.0"
+      impact: HIGH
+      likelihood: MEDIUM
+      technology: [express, sequelize, mongoose]
+      references:
+        - https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
+        - https://cwe.mitre.org/data/definitions/862.html
+    message: |
+      This handler performs an unbounded read or a bulk destructive operation
+      with no role or permission check anywhere in its body. Authentication
+      alone does not make an administrative endpoint administrative.
+
+      The shape to look for: the rendered admin page checks the role, and the
+      JSON endpoint behind it does not. Both are reachable with the same
+      session cookie, and only one of them was reviewed.
+
+      Confidence is LOW for two structural reasons, both of which produce
+      wrong answers in opposite directions:
+
+        - The rule sees only the handler. Express authorization usually lives
+          in route-level middleware in a different file, so a route properly
+          guarded by `isAdmin` still reports here.
+        - Conversely, a handler guarded by nothing but a missing middleware
+          entry reads as fine if its body happens to mention a role.
+
+      Read the route table before acting on a finding. See the README.
+    patterns:
+      # An unbounded read, or a bulk destructive write.
+      - pattern-either:
+          - pattern: $DB.$MODEL.findAll()
+          - pattern: $DB.$MODEL.findAll({})
+          - pattern: $MODEL.findAll()
+          - pattern: $MODEL.findAll({})
+          - pattern: $MODEL.find({})
+          - pattern: $MODEL.find()
+          # Quoted: an unquoted `truncate: ...` makes YAML read a mapping.
+          - pattern: "$DB.$MODEL.destroy({..., truncate: ..., ...})"
+          - pattern: $MODEL.deleteMany({})
+          - pattern: $MODEL.remove({})
+      # ...with no role or permission test in the handler body. The deep
+      # expression operator is required: the guard is a sub-expression of an
+      # `if` condition, which a statement-level ellipsis does not reach.
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            if (<... req.user.$F ...>) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            if (<... req.user.$F ...>) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            if (<... $X.role ...>) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            if (<... $X.role ...>) { ... }
+            ...
+          }
+      # Explicit authorization helpers, called as a statement in the body.
+      # These have to be function-scoped rather than a regex: `pattern-not-regex`
+      # is evaluated against the matched node, which is the ORM call, so it
+      # cannot see a guard three lines above it.
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            requireRole(...)
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            requireRole(...)
+            ...
+          }
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            requireAdmin(...)
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            requireAdmin(...)
+            ...
+          }
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            checkPermission(...)
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            checkPermission(...)
+            ...
+          }
+      - pattern-not-inside: |
+          function (...) {
+            ...
+            authorize(...)
+            ...
+          }
+      - pattern-not-inside: |
+          (...) => {
+            ...
+            authorize(...)
+            ...
+          }
+      # An unbounded read is one with no `where`. Semgrep treats a literal `{}`
+      # in a pattern as a wildcard matching ANY object literal, so
+      # `findAll({})` alone also matches `findAll({ where: ... })`. These two
+      # exclusions are what make the rule mean "unbounded".
+      - pattern-not: "$DB.$MODEL.findAll({..., where: ..., ...})"
+      - pattern-not: "$MODEL.findAll({..., where: ..., ...})"
+      - pattern-not: "$MODEL.find({..., where: ..., ...})"

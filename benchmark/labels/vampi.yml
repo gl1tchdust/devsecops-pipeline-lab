@@ -1,0 +1,110 @@
+# Hand-labelled authorization defects in OWASP VAmPI.
+#
+# This file is the ground truth the benchmark scores against. It is checked in
+# so the precision and recall numbers in the README are auditable: if you think
+# a label is wrong, the thing to argue with is right here, with line numbers.
+#
+# Labelling standard
+# ------------------
+# A line is labelled a defect when an unauthenticated or unauthorised caller
+# can, by changing only the request:
+#
+#   (a) read data belonging to another principal, or data the endpoint's own
+#       contract treats as privileged, or
+#   (b) perform a state change or privileged operation they should not reach.
+#
+# Deliberately NOT labelled:
+#
+#   - Endpoints that are public by their own OpenAPI contract AND expose
+#     nothing sensitive. VAmPI declares `bearerAuth` on 6 of its 14 operations;
+#     a public list of book titles is a design choice, not a defect.
+#   - Bug classes outside the three rules under test: SQL injection, user and
+#     password enumeration, regex DoS, JWT algorithm confusion. VAmPI contains
+#     all of these. Scoring authorization rules against them would understate
+#     recall for no reason.
+#
+# Where upstream marks its own intent with a source comment, that comment is
+# quoted as corroboration rather than relying on my reading alone.
+
+target:
+  name: VAmPI
+  repo: https://github.com/erev0s/VAmPI
+  commit: f16052dce83f05847133ec98f01c5193a41de7d8
+  language: python
+  framework: flask + connexion
+  scope:
+    - api_views
+    - models
+    - app.py
+    - config.py
+
+defects:
+  - file: api_views/books.py
+    line: 51
+    class: bola
+    endpoint: GET /books/v1/{book_title}
+    note: >-
+      Declares bearerAuth and validates the token, then loads the book by the
+      title in the URL with no ownership constraint. Returns another user's
+      secret_content.
+    evidence: 'upstream comment, books.py:50 "Broken Object Level Authorization"'
+
+  - file: api_views/users.py
+    line: 187
+    class: bola
+    endpoint: PUT /users/v1/{username}/password
+    note: >-
+      Declares bearerAuth and validates the token, then writes the password of
+      whatever username appears in the path. Full account takeover of any user.
+    evidence: 'upstream comment, users.py:186 "Unauthorized update of password of another user"'
+
+  - file: api_views/users.py
+    line: 25
+    class: bfla
+    endpoint: GET /users/v1/_debug
+    note: >-
+      No declared security and no check in the handler. Returns every user
+      record including plaintext passwords.
+    evidence: 'no security in openapi3.yml; handler calls get_all_users_debug() with no token_validator'
+
+  - file: api_views/users.py
+    line: 20
+    class: bfla
+    endpoint: GET /users/v1
+    note: >-
+      No declared security and no check in the handler. Enumerates every
+      username and email address.
+    evidence: 'no security in openapi3.yml; handler calls get_all_users() with no token_validator'
+
+  - file: api_views/main.py
+    line: 7
+    class: bfla
+    endpoint: GET /createdb
+    note: >-
+      No declared security. Calls db.drop_all() and recreates the schema, so
+      any anonymous caller can destroy all application data. Labelled a defect
+      despite being public by contract, because the contract is the bug.
+    evidence: 'no security in openapi3.yml; main.py:7 db.drop_all()'
+
+  - file: api_views/users.py
+    line: 46
+    class: bfla
+    endpoint: GET /users/v1/{username}
+    note: >-
+      No declared security and no check in the handler. Reads any user record
+      by username. The rules under test MISS this: the load goes through the
+      custom accessor User.get_user() rather than an ORM query the BOLA rule
+      recognises, and get_user is not in the BFLA accessor allowlist.
+    evidence: 'no security in openapi3.yml; users.py:46 User.get_user(username)'
+
+  - file: api_views/users.py
+    line: 65
+    class: mass-assignment
+    endpoint: POST /users/v1/register
+    note: >-
+      The caller can set the admin column by including "admin": true in the
+      registration body. The rules under test MISS this: the request value
+      controls which boolean literal is assigned, so the value reaching the
+      constructor carries no taint. Implicit control-flow dependence, which
+      the taint engine does not track.
+    evidence: 'upstream comment, users.py:60 "User is possible to define if she/he wants to be an admin"'

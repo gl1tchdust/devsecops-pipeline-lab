@@ -1,0 +1,80 @@
+# Hand-labelled authorization defects in appsecco/dvna.
+#
+# Same standard as labels/vampi.yml. Read that file's header first; the
+# labelling rule is identical and is not repeated here.
+#
+# Why this target is in the benchmark
+# -----------------------------------
+# DVNA is the uncomfortable case, and it is here on purpose. Its Product model
+# has no ownership column at all (models/product.js: id, code, name,
+# description, tags). Products are global. So every handler that loads a
+# product by `req.query.id` looks exactly like BOLA to a syntactic rule and is
+# not BOLA, because there is no owner to violate.
+#
+# That is why precision on this target is poor while recall is perfect, and it
+# is the most useful number in this repo: it says plainly that these rules
+# assume a multi-tenant data model and get noisy without one. On a codebase
+# like this the rules need a per-project allowlist of user-owned models before
+# the output is worth a reviewer's time.
+#
+# Deliberately NOT labelled, despite the rules firing on them:
+#
+#   core/appHandler.js listProducts, productSearch, modifyProduct,
+#   modifyProductSubmit   - Product has no owner, so no ownership violation.
+#   core/authHandler.js forgotPw, resetPw - a forgot-password flow must look a
+#   user up by the login that was submitted. There is no session yet to scope
+#   the query to. Pre-authentication lookups are a structural blind spot.
+#
+# Also out of scope: command injection (ping), SQL injection (userSearch),
+# insecure deserialisation (bulkProductsLegacy), XXE (bulkProducts), SSRF and
+# open redirect (redirect), eval (calc). DVNA is full of these and none of them
+# are authorization bugs.
+
+target:
+  name: DVNA
+  repo: https://github.com/appsecco/dvna
+  commit: 9ba473add536f66ac9007966acb2a775dd31277a
+  language: javascript
+  framework: express + sequelize
+  scope:
+    - core
+    - routes
+    - models
+    - server.js
+
+defects:
+  - file: core/appHandler.js
+    line: 145
+    class: bola
+    endpoint: POST /app/useredit
+    note: >-
+      Loads the user to edit by the id in the request body, then writes email,
+      name and a bcrypt-hashed password onto it. Any authenticated caller
+      rewrites any account's password by changing one form field. userEdit
+      (GET) nine lines above correctly reads req.user.id, so the safe and
+      unsafe versions sit side by side in one file.
+    evidence: 'appHandler.js:145 db.User.find({where:{id: req.body.id}}) then user.password = ...'
+
+  - file: core/appHandler.js
+    line: 207
+    class: bfla
+    endpoint: GET /app/admin/usersapi
+    note: >-
+      Returns every user row, including password hashes and roles, with no
+      role check. The route is mounted with isAuthenticated and nothing else,
+      while the /app/admin page it backs renders on req.user.role == 'admin'.
+      The page checks the role; the JSON endpoint behind it does not.
+    evidence: 'routes/app.js mounts it with authHandler.isAuthenticated only; appHandler.js:207 db.User.findAll({})'
+
+  - file: core/authHandler.js
+    line: 72
+    class: bola
+    endpoint: POST /resetpw
+    note: >-
+      Unauthenticated. Selects the account by the submitted login and sets a
+      new password, gated only by a token the caller can compute: the check is
+      req.body.token == md5(req.body.login). Account takeover of any user.
+      Labelled a defect because the missing authorization constraint on the
+      write is the bug; the predictable token (CWE-640) is a separate issue
+      none of these three rules claims to find.
+    evidence: 'authHandler.js:72 lookup by req.body.login; token check is md5(req.body.login)'
