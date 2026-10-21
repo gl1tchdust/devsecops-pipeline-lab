@@ -126,12 +126,12 @@ Measured against VAmPI at `f16052dc`, not quoted from marketing pages.
 |---|---|---|---|
 | Semgrep, registry rules | Source | 1 | Hardcoded `SECRET_KEY` at `config.py:13`. |
 | Semgrep, custom rules | Source | 6 | Both BOLA sites and four BFLA sites, one of which is a false positive. Registry rules found none of them. |
-| Trivy `fs` | Declared deps | 3 High | CVEs in `flask` 2.2.2 and `PyJWT` 2.6.0. Reads intent, not what shipped. |
-| Trivy `image` | Built layers | CI | OS packages the manifest never mentions. |
+| Trivy `fs` | Declared deps | 14, 1 Crit + 5 High | CVEs in `flask` 2.2.2 and `PyJWT` 2.6.0. Reads intent, not what shipped. |
+| Trivy `image` | Built layers | 32, 1 Crit + 10 High | 18 findings the dependency scan never sees. |
 | Trivy `config` | Dockerfile | 2 High, 1 Low | Runs as root, `apk add` without `--no-cache`, no `HEALTHCHECK`. |
 | Gitleaks | Full git history | 0 | Secrets in commits no longer checked out. |
-| Syft + Grype | SBOM of the tree | CI | Second opinion on Trivy's matching, and an artifact you can re-scan next month without rebuilding. |
-| ZAP baseline | The running app | CI | Headers, cookies and responses that only exist at runtime. |
+| Syft + Grype | SBOM of 13 components | 14 | A re-scannable artifact. As a second opinion it added nothing here, see below. |
+| ZAP baseline | The running app | 4, all Low/Info | Response headers. Nothing else, see below. |
 
 Three results are worth stopping on.
 
@@ -149,6 +149,41 @@ vendor can know your tenancy column is called `user_id`. It is why the custom
 rules exist, and why "we run Semgrep" is not the same sentence as "we test
 authorization."
 
+#### Someone else measured the same thing at larger scale
+
+VAmPI is a teaching target, so a negative result on it is suggestive rather
+than conclusive. ProjectDiscovery published a benchmark that is neither: three
+full-stack applications built by AI coding tools with ordinary product
+requirements, not prompted to be vulnerable, with 74 vulnerabilities confirmed
+by hand and classified in a public
+[`FINDINGS.csv`](https://github.com/projectdiscovery/research/tree/main/vibe-coding).
+
+Scored against that ground truth, by their measurement, not mine:
+
+| Scanner | Caught of 74 | False positives |
+|---|---|---|
+| Neo | 66 | 5 |
+| Claude Code | 41 | 24 |
+| Invicti (DAST) | 10 | 10 |
+| **Snyk** | **0** | 5 |
+| **Semgrep** | **0** | 3 |
+
+Twenty-one of those 74 are authorization or access-control defects, including
+one Critical and seven High. Semgrep's registry found none of them, and neither
+did Snyk.
+
+Two stages of *this* pipeline are Semgrep and Snyk. So the fair reading of this
+repo is not "these six tools cover you." It is that the dependency and
+secret-scanning stages do what they are good at, and the authorization coverage
+comes entirely from rules someone wrote for the application in front of them.
+
+Source: ProjectDiscovery,
+["Inside the benchmark"](https://projectdiscovery.io/blog/inside-the-benchmark-pp-architectures-finding-walkthroughs-and-what-each-scanner-actually-caught).
+Their apps are not yet scored here: all three use ORMs these rules do not
+recognise (Prisma, Drizzle, SQLAlchemy's expression API), so running them today
+would measure the gap in my pattern coverage rather than anything about the
+bug classes. Tracked as an issue.
+
 **Gitleaks found nothing, and Semgrep found the secret.** `SECRET_KEY = 'random'`
 is a real hardcoded credential. Gitleaks scanned the entire history and did not
 flag it, which is correct behaviour: gitleaks matches credential shapes and
@@ -158,7 +193,45 @@ overlapping names and almost no overlapping coverage.
 
 **Dependency scanning and image scanning are different scans.** `trivy fs`
 reads `requirements.txt`, a statement of intent. `trivy image` reads what is
-actually in the layers, including base-image OS packages no manifest mentions.
+actually in the layers. Measured on this target the image scan is a strict
+superset: 32 findings against 14, adding **18 the dependency scan never sees**
+and missing none of them. A pinned `requirements.txt` says nothing about the
+Alpine packages underneath it.
+
+**Grype added nothing over Trivy, and cost the gate accuracy.** Both found
+exactly 14 vulnerabilities in the same two packages with the same severity
+split. Not one extra finding between them. But Trivy reports CVE identifiers
+and Grype reports GHSA identifiers, and the overlap between the two sets is
+*zero* by identifier:
+
+```
+trivy fs : CVE-2023-30861, CVE-2026-32597, CVE-2026-48526, ...
+grype    : GHSA-68rp-wp8r-4726, GHSA-2gx3-rcp4-g85q, ...
+```
+
+Same vulnerabilities, different names. The gate keys suppressions on rule id,
+so it counts them as 28 distinct findings and a suppression written for a CVE
+will not silence its GHSA twin. Running both scanners buys nothing here and
+would make every dependency exception need writing twice.
+
+That is a limitation of the gate, not of either tool. The fix is an advisory
+alias map (GHSA to CVE) before matching, which this repo does not implement. It
+is a deliberate omission rather than an oversight: the honest version of "we
+run two SCA tools for coverage" is that you need identifier normalisation
+first, and most pipelines that stack scanners do not have it.
+
+**A ZAP baseline scan does not test authorization.** It found 4 alerts, all Low
+or Info: a missing `Cross-Origin-Resource-Policy` header, a leaked `Server`
+version, a missing `X-Content-Type-Options`, and cacheable content. Zero High.
+Against the same application where the static rules found seven authorization
+defects, the baseline scan found **none of them**.
+
+That is correct behaviour. `zap-baseline.py` is a passive spider and a header
+check; it never authenticates as two different users, so it cannot possibly
+observe that one of them can read the other's records. It is in the pipeline
+because runtime headers are a real surface nothing else looks at, not because
+it covers DAST. Testing authorization dynamically needs two sessions and a
+differential comparison, which is a different tool and is out of scope here.
 
 ## The rules
 
@@ -324,7 +397,7 @@ worth shipping. One presented as complete coverage of a bug class is not.
 | Unparseable report | **Blocks**, exit 2. | A truncated report and a clean scan both look like "no findings". They must never be treated alike. |
 | Accuracy below floor | **Blocks.** | A rule edit that loses precision or recall is a regression. |
 
-On the current run that is 13 blocking, 2 suppressed, 17 logged.
+On the latest CI run that is 82 findings: 30 blocking, 2 suppressed, 50 logged.
 
 Severity is normalised across tools so Trivy's CVSS 7.5 and a Semgrep `ERROR`
 land in the same band. The order is: numeric `security-severity` if present,
